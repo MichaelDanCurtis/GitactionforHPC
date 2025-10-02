@@ -1,0 +1,141 @@
+name: Upload Cloud-Init to Azure Blob
+
+on:
+  workflow_dispatch:
+    inputs:
+      storage_account_name:
+        description: 'Azure Storage account name (destination)'
+        required: true
+        type: string
+      storage_container:
+        description: 'Azure Storage container name (destination)'
+        required: true
+        type: string
+      source_file:
+        description: 'Path to the cloud-init file within the repo'
+        required: true
+        default: 'cloud_init/scaleset_cloud.init'
+        type: string
+      blob_name:
+        description: 'Destination blob name'
+        required: true
+        default: 'scaleset_cloud.init'
+        type: string
+      content_type:
+        description: 'Blob content-type'
+        required: true
+        default: 'text/cloud-config'
+        type: string
+      create_container:
+        description: 'Create the container if it does not exist'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  # Optional, but recommended if you operate across multiple subscriptions
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  upload-cloud-init:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate source file exists
+        shell: bash
+        run: |
+          FILE_PATH="${{ github.event.inputs.source_file }}"
+          if [ ! -f "$FILE_PATH" ]; then
+            echo "❌ File not found: $FILE_PATH"
+            echo "Ensure the file exists at that path within the repository."
+            exit 1
+          fi
+          echo "✅ Found file: $FILE_PATH"
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription (if provided)
+        if: ${{ env.AZURE_SUBSCRIPTION_ID != '' }}
+        shell: bash
+        run: |
+          az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+          echo "Using subscription: $(az account show --query id -o tsv)"
+
+      - name: Create container (if requested)
+        if: ${{ github.event.inputs.create_container == 'true' }}
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az storage container create \
+              --name "${{ github.event.inputs.storage_container }}" \
+              --account-name "${{ github.event.inputs.storage_account_name }}" \
+              --auth-mode login \
+              --output table
+
+      - name: Upload cloud-init to blob
+        id: upload
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            ACCOUNT="${{ github.event.inputs.storage_account_name }}"
+            CONTAINER="${{ github.event.inputs.storage_container }}"
+            SRC="${{ github.event.inputs.source_file }}"
+            NAME="${{ github.event.inputs.blob_name }}"
+            TYPE="${{ github.event.inputs.content_type }}"
+
+            echo "Uploading $SRC to https://$ACCOUNT.blob.core.windows.net/$CONTAINER/$NAME ..."
+            az storage blob upload \
+              --account-name "$ACCOUNT" \
+              --container-name "$CONTAINER" \
+              --name "$NAME" \
+              --file "$SRC" \
+              --content-type "$TYPE" \
+              --overwrite true \
+              --auth-mode login \
+              --no-progress
+
+            # Verify upload
+            EXISTS=$(az storage blob exists \
+              --account-name "$ACCOUNT" \
+              --container-name "$CONTAINER" \
+              --name "$NAME" \
+              --auth-mode login \
+              --query exists -o tsv)
+
+            if [ "$EXISTS" != "true" ]; then
+              echo "❌ Upload verification failed"
+              exit 1
+            fi
+
+            SIZE=$(az storage blob show \
+              --account-name "$ACCOUNT" \
+              --container-name "$CONTAINER" \
+              --name "$NAME" \
+              --auth-mode login \
+              --query properties.contentLength -o tsv)
+
+            URL="https://$ACCOUNT.blob.core.windows.net/$CONTAINER/$NAME"
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+            echo "✅ Upload verified: $URL ($SIZE bytes)"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Upload Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: ${{ github.event.inputs.source_file }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Destination: https://${{ github.event.inputs.storage_account_name }}.blob.core.windows.net/${{ github.event.inputs.storage_container }}/${{ github.event.inputs.blob_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Content-Type: ${{ github.event.inputs.content_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Created Container: ${{ github.event.inputs.create_container }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Size (bytes): ${{ steps.upload.outputs.size }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"

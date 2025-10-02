@@ -1,0 +1,127 @@
+name: Delete Azure Resource
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_name:
+        description: 'Name of the Azure resource to delete'
+        required: true
+        type: string
+      resource_type:
+        description: 'Type of Azure resource'
+        required: true
+        type: choice
+        options:
+          - 'Microsoft.ContainerRegistry/registries'
+          - 'Microsoft.Storage/storageAccounts'
+          - 'Microsoft.Web/sites'
+          - 'Microsoft.Compute/virtualMachines'
+          - 'Microsoft.KeyVault/vaults'
+          - 'Microsoft.Network/virtualNetworks'
+          - 'Microsoft.Sql/servers'
+        default: 'Microsoft.ContainerRegistry/registries'
+      resource_group:
+        description: 'Azure Resource Group name'
+        required: true
+        type: string
+      confirm_deletion:
+        description: 'Type "DELETE" to confirm resource deletion'
+        required: true
+        type: string
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  delete-resource:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Validate confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_deletion }}" != "DELETE" ]; then
+          echo "❌ Deletion not confirmed. You must type 'DELETE' exactly to proceed."
+          exit 1
+        fi
+        echo "✅ Deletion confirmed"
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Set Azure Subscription
+      run: |
+        az account set --subscription ${{ env.AZURE_SUBSCRIPTION_ID }}
+        echo "Using subscription: $(az account show --query name -o tsv)"
+    
+    - name: Check if resource exists
+      id: check_resource
+      run: |
+        echo "🔍 Searching for resource: ${{ github.event.inputs.resource_name }}"
+        echo "Resource type: ${{ github.event.inputs.resource_type }}"
+        echo "Resource group: ${{ github.event.inputs.resource_group }}"
+        
+        # Search for the resource
+        resource_id=$(az resource list \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --resource-type "${{ github.event.inputs.resource_type }}" \
+          --query "[?name=='${{ github.event.inputs.resource_name }}'].id" \
+          --output tsv)
+        
+        if [ -z "$resource_id" ]; then
+          echo "❌ Resource '${{ github.event.inputs.resource_name }}' of type '${{ github.event.inputs.resource_type }}' not found in resource group '${{ github.event.inputs.resource_group }}'"
+          exit 1
+        else
+          echo "✅ Found resource: $resource_id"
+          echo "resource_id=$resource_id" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Get resource details
+      run: |
+        echo "📋 Resource details:"
+        az resource show --ids "${{ steps.check_resource.outputs.resource_id }}" \
+          --query "{name: name, type: type, location: location, resourceGroup: resourceGroup}" \
+          --output table
+    
+    - name: Delete resource
+      run: |
+        echo "🗑️ Deleting resource: ${{ github.event.inputs.resource_name }}"
+        
+        # Delete the resource
+        az resource delete \
+          --ids "${{ steps.check_resource.outputs.resource_id }}" \
+          --verbose
+        
+        echo "✅ Resource '${{ github.event.inputs.resource_name }}' has been deleted"
+    
+    - name: Verify deletion
+      run: |
+        echo "🔍 Verifying resource deletion..."
+        
+        # Check if resource still exists
+        resource_exists=$(az resource list \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --resource-type "${{ github.event.inputs.resource_type }}" \
+          --query "[?name=='${{ github.event.inputs.resource_name }}'].id" \
+          --output tsv)
+        
+        if [ -z "$resource_exists" ]; then
+          echo "✅ Confirmed: Resource '${{ github.event.inputs.resource_name }}' has been successfully deleted"
+        else
+          echo "⚠️ Warning: Resource may still exist or deletion is still in progress"
+          exit 1
+        fi
+    
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Deletion Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Name**: ${{ github.event.inputs.resource_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Type**: ${{ github.event.inputs.resource_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: ${{ github.event.inputs.resource_group }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY

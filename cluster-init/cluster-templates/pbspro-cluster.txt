@@ -1,0 +1,214 @@
+# Azure CycleCloud PBS Pro Cluster Template
+# 
+# This template defines the infrastructure for a PBS Professional cluster
+# with autoscaling support. All nodes use PRIVATE networking only.
+#
+# CUSTOMIZATION GUIDE:
+# - Modify VM sizes by changing DefaultValue in parameter sections
+# - Adjust autoscale limits (MaxExecuteCoreCount, MaxHTCCoreCount)
+# - Add custom node arrays by copying [[nodearray]] blocks
+# - Add additional cluster-init specs for custom software
+# - Enable spot instances by changing UseLowPrio default
+#
+# After editing, commit changes - the workflow will use this file automatically.
+
+[cluster pbspro]
+FormLayout = selectionpanel
+Category = Schedulers
+
+Autoscale = $Autoscale
+
+    [[node defaults]]
+    UsePublicNetwork = false
+    Credentials = $Credentials
+    Region = $Region
+    KeyPairLocation = ~/.ssh/cyclecloud.pem
+    
+        [[[configuration]]]
+        cyclecloud.mounts.sched.disabled = true
+        cyclecloud.exports.sched.disabled = true
+        cshared.server.legacy_links_disabled = true
+        
+        [[[cluster-init cyclecloud/pbspro:default]]]
+
+    [[node master]]
+    MachineType = $MasterMachineType
+    IsReturnProxy = $ReturnProxy
+    AdditionalClusterInitSpecs = $MasterClusterInitSpecs
+    
+        [[[configuration]]]
+        
+        [[[cluster-init cyclecloud/pbspro:master]]]
+        
+        [[[cluster-init pbspro-autoscale:default]]]
+        Order = 20000
+        
+        [[[network-interface eth0]]]
+        AssociatePublicIpAddress = false
+
+    [[nodearray execute]]
+    MachineType = $ExecuteMachineType
+    MaxCoreCount = $MaxExecuteCoreCount
+    Interruptible = $UseLowPrio
+    AdditionalClusterInitSpecs = $ExecuteClusterInitSpecs
+    
+        [[[configuration]]]
+        
+        [[[cluster-init cyclecloud/pbspro:execute]]]
+        
+        [[[network-interface eth0]]]
+        AssociatePublicIpAddress = false
+
+    [[nodearray htc]]
+    MachineType = $HTCMachineType
+    MaxCoreCount = $MaxHTCCoreCount
+    Interruptible = $UseLowPrio
+    AdditionalClusterInitSpecs = $HTCClusterInitSpecs
+    
+        [[[configuration]]]
+        
+        [[[cluster-init cyclecloud/pbspro:execute]]]
+        
+        [[[network-interface eth0]]]
+        AssociatePublicIpAddress = false
+
+[parameters About]
+Order = 1
+
+    [[parameters About PBSPro]]
+
+        [[[parameter pbspro]]]
+        HideLabel = true
+        Config.Plugin = pico.widget.HtmlTemplateWidget
+        Config.Template = "<p>PBS Professional from Altair is a highly scalable workload manager.</p><p><strong>Note:</strong> All nodes use private networking only. Access via VPN, ExpressRoute, or bastion host required.</p>"
+
+[parameters Required Settings]
+Order = 10
+
+    [[parameters Virtual Machines]]
+    Description = "Configure the virtual machine types for the cluster."
+    Order = 20
+    
+        [[[parameter Region]]]
+        Label = Region
+        Description = Azure region for the cluster
+        ParameterType = Cloud.Region
+
+        [[[parameter MasterMachineType]]]
+        Label = Master VM Type
+        Description = VM type for PBS master (scheduler and submission node)
+        ParameterType = Cloud.MachineType
+        DefaultValue = Standard_D4s_v3
+
+        [[[parameter ExecuteMachineType]]]
+        Label = Execute VM Type
+        Description = VM type for tightly-coupled MPI workloads
+        ParameterType = Cloud.MachineType
+        DefaultValue = Standard_F4s_v2
+
+    [[parameters Auto-Scaling]]
+    Description = "Configure autoscaling limits for the cluster."
+    Order = 30
+    
+        [[[parameter Autoscale]]]
+        Label = Autoscale
+        DefaultValue = true
+        Widget.Plugin = pico.form.BooleanCheckBox
+        Widget.Label = Start and stop execute nodes automatically
+
+        [[[parameter MaxExecuteCoreCount]]]
+        Label = Max Execute Cores
+        Description = Maximum number of execute cores to start (MPI jobs)
+        DefaultValue = 100
+        Config.Plugin = pico.form.NumberTextBox
+        Config.MinValue = 1
+        Config.IntegerOnly = true
+
+        [[[parameter MaxHTCCoreCount]]]
+        Label = Max HTC Cores
+        Description = Maximum number of HTC cores to start (embarrassingly parallel)
+        DefaultValue = 200
+        Config.Plugin = pico.form.NumberTextBox
+        Config.MinValue = 1
+        Config.IntegerOnly = true
+
+        [[[parameter HTCMachineType]]]
+        Label = HTC VM Type
+        Description = VM type for high-throughput computing nodes
+        ParameterType = Cloud.MachineType
+        DefaultValue = Standard_F2s_v2
+
+    [[parameters Networking]]
+    Order = 40
+    
+        [[[parameter SubnetId]]]
+        Label = Subnet ID
+        Description = Azure subnet resource ID (REQUIRED for private networking)
+        ParameterType = Azure.Subnet
+        Required = true
+
+[parameters Advanced Settings]
+Order = 20
+
+    [[parameters Azure Settings]]
+    Order = 10
+    
+        [[[parameter Credentials]]]
+        Description = Cloud credentials for Azure resource access
+        ParameterType = Cloud.Credentials
+
+    [[parameters Software]]
+    Description = "Specify optional cluster-init specs to apply custom software."
+    Order = 10
+    
+        [[[parameter MasterClusterInitSpecs]]]
+        Label = Master Cluster-Init
+        DefaultValue = =undefined
+        Description = Additional cluster-init specs for master node (e.g., monitoring, custom tools)
+        ParameterType = Cloud.ClusterInitSpecs
+
+        [[[parameter ExecuteClusterInitSpecs]]]
+        Label = Execute Cluster-Init
+        DefaultValue = =undefined
+        Description = Additional cluster-init specs for execute nodes (e.g., MPI libraries, compilers)
+        ParameterType = Cloud.ClusterInitSpecs
+
+        [[[parameter HTCClusterInitSpecs]]]
+        Label = HTC Cluster-Init
+        DefaultValue = =undefined
+        Description = Additional cluster-init specs for HTC nodes (e.g., application runtimes)
+        ParameterType = Cloud.ClusterInitSpecs
+
+    [[parameters Advanced Networking]]
+    Description = "Advanced networking configuration (private network only)."
+    Order = 20
+    
+        [[[parameter ReturnProxy]]]
+        Label = Return Proxy
+        DefaultValue = true
+        ParameterType = Boolean
+        Config.Label = Use master node as SSH proxy for execute nodes
+
+        [[[parameter UsePublicNetwork]]]
+        Label = Public Master (DEPRECATED)
+        DefaultValue = false
+        ParameterType = Boolean
+        Config.Label = IGNORED - All nodes use private networking
+        Config.Readonly = true
+
+        [[[parameter ExecuteNodesPublic]]]
+        Label = Public Execute (DEPRECATED)
+        DefaultValue = false
+        ParameterType = Boolean
+        Config.Label = IGNORED - All nodes use private networking
+        Config.Readonly = true
+
+    [[parameters Node Health Checks]]
+    Description = "Spot instance and cost optimization configuration."
+    Order = 30
+    
+        [[[parameter UseLowPrio]]]
+        Label = Use Spot Instances
+        DefaultValue = false
+        ParameterType = Boolean
+        Config.Label = Use low-priority spot instances for cost savings

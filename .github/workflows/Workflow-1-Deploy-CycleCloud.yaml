@@ -1,0 +1,636 @@
+# Required GitHub repository variables:
+#   RESOURCE_GROUP                          (Azure resource group for deployment targets)
+#   AZURE_REGION                            (Azure region for container instances)
+#   VIRTUAL_NETWORK_NAME                    (VNet name for PRIVATE networking - REQUIRED)
+#   VIRTUAL_NETWORK_RESOURCE_GROUP_NAME     (VNet resource group - REQUIRED)
+#   VIRTUAL_NETWORK_SUBNET_NAME             (Subnet name - REQUIRED)
+#
+# SECURITY NOTE: This workflow ONLY supports private networking.
+# All deployments require a VNet configuration. Public IP deployments are not permitted.
+name: Workflow 1 - Deploy CycleCloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Azure resource group target"
+        required: true
+        type: choice
+        options:
+          - RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+          - RG-BH_HPC_Cloud_Azure-QA-SUB-000002-EastUS-qa
+        default: RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+      image_tag:
+        description: "CycleCloud image tag from mcr.microsoft.com/hpc/azure-cyclecloud"
+        required: false
+        type: string
+        default: "latest"
+      container_instance_name:
+        description: "Azure Container Instance name"
+        required: false
+        type: string
+        default: "cyclecloud-mcr"
+      cpu_cores:
+        description: "CPU cores requested for the container"
+        required: false
+        type: choice
+        options:
+          - "2"
+          - "4"
+          - "8"
+        default: "2"
+      memory_gb:
+        description: "Memory in GiB requested for the container"
+        required: false
+        type: choice
+        options:
+          - "4"
+          - "8"
+          - "16"
+        default: "8"
+      deployment_mode:
+        description: "Deployment behaviour (update uses latest, passive skips if running, forced recreates)"
+        required: true
+        type: choice
+        options:
+          - update
+          - passive
+          - forced
+        default: forced
+
+jobs:
+  deploy-cyclecloud-mcr:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login using federated credentials
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Inspect service-principal permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Collecting role assignments for context."
+          az account show --output table
+
+          AZURE_CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          CLIENT_ID=$(printf "%s" "$AZURE_CREDS" | jq -r '.clientId // empty')
+          TENANT_ID=$(printf "%s" "$AZURE_CREDS" | jq -r '.tenantId // empty')
+
+          if [ -z "$CLIENT_ID" ] || [ -z "$TENANT_ID" ]; then
+            echo "::warning::AZURE_CREDENTIALS is missing clientId or tenantId. Role audit skipped."
+          else
+            echo "Service principal clientId: $CLIENT_ID"
+            echo "Tenant: $TENANT_ID"
+            az role assignment list --assignee "$CLIENT_ID" --output table || {
+              echo "::warning::Unable to list role assignments. Ensure the service principal has at least Microsoft.ContainerInstance/containerGroups permissions on the target resource group and AcrPull for private registries."
+            }
+          fi
+
+      - name: Resolve configuration inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUESTED_IMAGE_TAG="${{ inputs.image_tag }}"
+          if [ -z "$REQUESTED_IMAGE_TAG" ]; then
+            REQUESTED_IMAGE_TAG="latest"
+          fi
+
+          echo "REQUESTED_IMAGE_TAG=$REQUESTED_IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "CONTAINER_INSTANCE_NAME=${{ inputs.container_instance_name }}" >> "$GITHUB_ENV"
+          echo "CPU_CORES=${{ inputs.cpu_cores }}" >> "$GITHUB_ENV"
+          echo "MEMORY_GB=${{ inputs.memory_gb }}" >> "$GITHUB_ENV"
+
+          echo "AZURE_RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AZURE_REGION=${{ vars.AZURE_REGION }}" >> "$GITHUB_ENV"
+          echo "VNET_NAME=${{ vars.VIRTUAL_NETWORK_NAME }}" >> "$GITHUB_ENV"
+          echo "VNET_RESOURCE_GROUP=${{ vars.VIRTUAL_NETWORK_RESOURCE_GROUP_NAME }}" >> "$GITHUB_ENV"
+          echo "SUBNET_NAME=${{ vars.VIRTUAL_NETWORK_SUBNET_NAME }}" >> "$GITHUB_ENV"
+
+          echo "CONTAINER_REPOSITORY=hpc/azure-cyclecloud" >> "$GITHUB_ENV"
+          echo "CONTAINER_REGISTRY=mcr.microsoft.com" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_MODE=${{ inputs.deployment_mode }}" >> "$GITHUB_ENV"
+
+          echo "Configuration overview:"
+          echo "  Resource group variable: '${{ vars.RESOURCE_GROUP }}'"
+          echo "  Region variable: '${{ vars.AZURE_REGION }}'"
+          echo "  VNet: '${{ vars.VIRTUAL_NETWORK_NAME }}'"
+          echo "  Subnet: '${{ vars.VIRTUAL_NETWORK_SUBNET_NAME }}'"
+          echo "  Requested image tag: '$REQUESTED_IMAGE_TAG'"
+          echo "  Deployment mode: '${{ inputs.deployment_mode }}'"
+
+      - name: Validate Azure scope and network prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$AZURE_RESOURCE_GROUP" ]; then
+            echo "::error::Repository variable RESOURCE_GROUP is required."
+            exit 1
+          fi
+
+          if [ -z "$AZURE_REGION" ]; then
+            echo "::error::Repository variable AZURE_REGION is required."
+            exit 1
+          fi
+
+          if ! az group exists --name "$AZURE_RESOURCE_GROUP" >/dev/null; then
+            echo "::error::Resource group '$AZURE_RESOURCE_GROUP' does not exist or you lack permissions."
+            exit 1
+          fi
+
+          echo "Resource group validation succeeded."
+
+          # Validate VNet configuration (REQUIRED for private networking)
+          if [ -z "$VNET_NAME" ] || [ -z "$VNET_RESOURCE_GROUP" ] || [ -z "$SUBNET_NAME" ]; then
+            echo "::error::Virtual network configuration is REQUIRED."
+            echo "::error::Please set the following repository variables:"
+            echo "::error::  - VIRTUAL_NETWORK_NAME"
+            echo "::error::  - VIRTUAL_NETWORK_RESOURCE_GROUP_NAME"
+            echo "::error::  - VIRTUAL_NETWORK_SUBNET_NAME"
+            echo "::error::Public IP deployments are not permitted for security reasons."
+            exit 1
+          fi
+
+          echo "Private VNet deployment required. Validating network resources..."
+          if ! az network vnet show --resource-group "$VNET_RESOURCE_GROUP" --name "$VNET_NAME" >/dev/null; then
+            echo "::error::Virtual network '$VNET_NAME' not found in resource group '$VNET_RESOURCE_GROUP'."
+            exit 1
+          fi
+          if ! az network vnet subnet show --resource-group "$VNET_RESOURCE_GROUP" --vnet-name "$VNET_NAME" --name "$SUBNET_NAME" >/dev/null; then
+            echo "::error::Subnet '$SUBNET_NAME' not found in virtual network '$VNET_NAME'."
+            exit 1
+          fi
+
+          echo "NETWORK_MODE=private" >> "$GITHUB_ENV"
+          echo "✅ Network validation succeeded: Private networking with VNet '$VNET_NAME'"
+
+          if az container show --resource-group "$AZURE_RESOURCE_GROUP" --name "$CONTAINER_INSTANCE_NAME" >/dev/null 2>&1; then
+            echo "::warning::Container instance '$CONTAINER_INSTANCE_NAME' already exists. It will be replaced."
+            echo "CONTAINER_ALREADY_EXISTS=true" >> "$GITHUB_ENV"
+            echo "CONTAINER_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "CONTAINER_ALREADY_EXISTS=false" >> "$GITHUB_ENV"
+            echo "CONTAINER_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Discover CycleCloud image tag from MCR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_LIST_URL="https://mcr.microsoft.com/v2/${CONTAINER_REPOSITORY}/tags/list"
+          echo "Fetching available tags from $TAG_LIST_URL"
+
+          if ! curl -fsSL "$TAG_LIST_URL" -o mcr-tags.json; then
+            echo "::error::Failed to download tag listing from Microsoft Container Registry."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import textwrap
+
+          exec(textwrap.dedent(
+              """
+              tags_path = pathlib.Path("mcr-tags.json")
+              if not tags_path.exists():
+                print("::error::Tag listing file 'mcr-tags.json' not found after download.")
+                sys.exit(1)
+
+              data = json.loads(tags_path.read_text())
+              tags = sorted(set(data.get("tags") or []))
+              if not tags:
+                print("::error::Microsoft Container Registry returned no tags for hpc/azure-cyclecloud.")
+                sys.exit(1)
+
+              requested = os.environ.get("REQUESTED_IMAGE_TAG", "latest")
+              deployment_mode = os.environ.get("DEPLOYMENT_MODE", "forced")
+
+              semver_pattern = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-_].*)?$")
+              semver_tags = []
+              for tag in tags:
+                match = semver_pattern.match(tag)
+                if match:
+                  semver_tags.append(((int(match.group(1)), int(match.group(2)), int(match.group(3))), tag))
+
+              semver_tags.sort(reverse=True)
+              latest_semver_tag = semver_tags[0][1] if semver_tags else None
+
+              selected_tag = requested
+              selection_reason = "user-requested tag"
+
+              if deployment_mode == "update":
+                if latest_semver_tag is None:
+                  print("::error::No semantic version tags found in the registry; cannot auto-select for update mode.")
+                  sys.exit(1)
+                selected_tag = latest_semver_tag
+                selection_reason = "latest semantic-version tag"
+              elif deployment_mode == "passive":
+                if requested.lower() == "latest":
+                  if latest_semver_tag is None:
+                    print("::error::No semantic version tags found in the registry; cannot resolve 'latest' in passive mode.")
+                    sys.exit(1)
+                  selected_tag = latest_semver_tag
+                  selection_reason = "passive mode resolved 'latest' to newest semantic version"
+                elif requested not in tags:
+                  print(f"::error::Requested tag '{requested}' not found in registry. Passive mode requires an existing tag.")
+                  sys.exit(1)
+              elif requested.lower() == "latest":
+                if latest_semver_tag is not None:
+                  selected_tag = latest_semver_tag
+                  selection_reason = "translated 'latest' to most recent semantic version"
+                elif "latest" in tags:
+                  selected_tag = "latest"
+                  selection_reason = "using explicit 'latest' tag available in registry"
+                else:
+                  print("::error::No 'latest' alias and unable to infer most recent version. Specify a concrete image tag.")
+                  sys.exit(1)
+              elif selected_tag not in tags:
+                sample = ", ".join(list(reversed(tags))[:20])
+                print(f"::error::Requested tag '{selected_tag}' not found in registry. Sample available tags: {sample}")
+                sys.exit(1)
+
+              pathlib.Path("selected-tag.txt").write_text(selected_tag + "\n", encoding="utf-8")
+              pathlib.Path("available-tags.txt").write_text("\n".join(reversed(tags)) + "\n", encoding="utf-8")
+
+              env_path = pathlib.Path(os.environ["GITHUB_ENV"])
+              with env_path.open("a", encoding="utf-8") as env:
+                env.write(f"AVAILABLE_TAGS={'|'.join(tags)}\n")
+                if latest_semver_tag:
+                  env.write(f"LATEST_SEMVER_TAG={latest_semver_tag}\n")
+                env.write(f"IMAGE_TAG={selected_tag}\n")
+                env.write(f"IMAGE_SELECTION_REASON={selection_reason}\n")
+
+              print(f"Selected CycleCloud tag: {selected_tag} ({selection_reason})")
+              print("Available tags written to available-tags.txt (latest first).")
+              """
+          ))
+          PY
+
+          echo "Tag discovery complete. Selected image: $CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG"
+
+      - name: Inspect existing container instance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Inspecting existing container state..."
+          if az container show --resource-group "$AZURE_RESOURCE_GROUP" --name "$CONTAINER_INSTANCE_NAME" --output json > existing-container.json 2>/dev/null; then
+            echo "CONTAINER_EXISTS=true" >> "$GITHUB_ENV"
+
+            EXISTING_STATE=$(jq -r '.instanceView.state // "unknown"' existing-container.json)
+            EXISTING_IMAGE=$(jq -r '.containers[0].properties.image // ""' existing-container.json)
+            EXISTING_PRIVATE_IP=$(jq -r '.ipAddress.ip // "unassigned"' existing-container.json)
+            EXISTING_FQDN=$(jq -r '.ipAddress.fqdn // "unassigned"' existing-container.json)
+            EXISTING_PROVISIONING=$(jq -r '.provisioningState // .properties.provisioningState // "unknown"' existing-container.json)
+
+            if [ -n "$EXISTING_IMAGE" ] && [[ "$EXISTING_IMAGE" == *:* ]]; then
+              EXISTING_TAG="${EXISTING_IMAGE##*:}"
+            else
+              EXISTING_TAG=""
+            fi
+
+            echo "EXISTING_CONTAINER_STATE=$EXISTING_STATE" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_IMAGE=$EXISTING_IMAGE" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_TAG=$EXISTING_TAG" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_PRIVATE_IP=$EXISTING_PRIVATE_IP" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_FQDN=$EXISTING_FQDN" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_PROVISIONING=$EXISTING_PROVISIONING" >> "$GITHUB_ENV"
+
+            echo "CONTAINER_STATE=$EXISTING_STATE" >> "$GITHUB_ENV"
+            echo "CONTAINER_PRIVATE_IP=$EXISTING_PRIVATE_IP" >> "$GITHUB_ENV"
+            echo "CONTAINER_FQDN=$EXISTING_FQDN" >> "$GITHUB_ENV"
+            echo "FINAL_CONTAINER_IMAGE=$EXISTING_IMAGE" >> "$GITHUB_ENV"
+            echo "FINAL_CONTAINER_TAG=$EXISTING_TAG" >> "$GITHUB_ENV"
+
+            echo "Existing container detected: state=$EXISTING_STATE, image=$EXISTING_IMAGE"
+          else
+            echo "No existing container detected."
+            echo "CONTAINER_EXISTS=false" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_STATE=absent" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_IMAGE=" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_TAG=" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_PRIVATE_IP=unassigned" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_FQDN=unassigned" >> "$GITHUB_ENV"
+            echo "EXISTING_CONTAINER_PROVISIONING=absent" >> "$GITHUB_ENV"
+
+            echo "CONTAINER_STATE=absent" >> "$GITHUB_ENV"
+            echo "CONTAINER_PRIVATE_IP=unassigned" >> "$GITHUB_ENV"
+            echo "CONTAINER_FQDN=unassigned" >> "$GITHUB_ENV"
+            echo "FINAL_CONTAINER_IMAGE=" >> "$GITHUB_ENV"
+            echo "FINAL_CONTAINER_TAG=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Determine deployment action
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODE="${DEPLOYMENT_MODE:-forced}"
+          CURRENT_TAG="${EXISTING_CONTAINER_TAG:-}"
+          CURRENT_STATE="${EXISTING_CONTAINER_STATE:-absent}"
+          TARGET_TAG="${IMAGE_TAG:-latest}"
+
+          PROCEED="true"
+          DELETE="false"
+          REASON=""
+
+          case "$MODE" in
+            passive)
+              if [ "${CONTAINER_EXISTS:-false}" = "true" ] && [ "$CURRENT_STATE" = "Running" ]; then
+                PROCEED="false"
+                REASON="Passive mode detected a healthy container ($CURRENT_TAG); skipping deployment."
+              else
+                PROCEED="true"
+                REASON="Passive mode did not find a healthy container; proceeding with deployment."
+              fi
+              ;;
+            update)
+              if [ "${CONTAINER_EXISTS:-false}" != "true" ]; then
+                PROCEED="true"
+                REASON="Update mode found no existing container; deploying tag $TARGET_TAG."
+              elif [ -z "$CURRENT_TAG" ]; then
+                PROCEED="true"
+                DELETE="true"
+                REASON="Update mode could not determine current tag; redeploying with $TARGET_TAG."
+              elif [ "$CURRENT_TAG" = "$TARGET_TAG" ]; then
+                PROCEED="false"
+                REASON="Container already on tag $CURRENT_TAG; update not required."
+              else
+                PROCEED="true"
+                DELETE="true"
+                REASON="Updating container from $CURRENT_TAG to $TARGET_TAG."
+              fi
+              ;;
+            forced)
+              if [ "${CONTAINER_EXISTS:-false}" = "true" ]; then
+                DELETE="true"
+                REASON="Forced mode replacing existing container running tag ${CURRENT_TAG:-unknown}."
+              else
+                REASON="Forced mode with no existing container; creating new deployment."
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported deployment mode '$MODE'."
+              exit 1
+              ;;
+          esac
+
+          echo "PROCEED_WITH_DEPLOYMENT=$PROCEED" >> "$GITHUB_ENV"
+          echo "DELETE_EXISTING_CONTAINER=$DELETE" >> "$GITHUB_ENV"
+          echo "DEPLOYMENT_DECISION_REASON=$REASON" >> "$GITHUB_ENV"
+
+          echo "Deployment decision: $REASON"
+          if [ "$PROCEED" != "true" ]; then
+            echo "::notice::$REASON"
+          fi
+
+      - name: Deploy container instance
+        if: env.PROCEED_WITH_DEPLOYMENT == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_FULL_NAME="$CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG"
+          echo "Preparing to deploy $IMAGE_FULL_NAME"
+          echo "Deployment decision summary: ${DEPLOYMENT_DECISION_REASON:-not recorded}"
+
+          # Lookup subnet ID for private networking (always required)
+          SUBNET_ID=$(az network vnet subnet show \
+            --resource-group "$VNET_RESOURCE_GROUP" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_NAME" \
+            --query id \
+            --output tsv)
+
+          if [ -z "$SUBNET_ID" ]; then
+            echo "::error::Subnet ID lookup returned empty. Verify permissions on the virtual network."
+            exit 1
+          fi
+
+          NETWORK_ARGS=(--subnet "$SUBNET_ID")
+          ADDRESS_MODE_DESCRIPTION="private VNet $VNET_NAME/$SUBNET_NAME"
+
+          echo "Network mode: $ADDRESS_MODE_DESCRIPTION (private networking only)"
+
+          if [ "${DELETE_EXISTING_CONTAINER:-false}" = "true" ]; then
+            echo "Deleting existing container '$CONTAINER_INSTANCE_NAME' before deployment (forced or update mode)."
+            az container delete \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$CONTAINER_INSTANCE_NAME" \
+              --yes \
+              --only-show-errors \
+              >/dev/null 2>&1 || true
+          else
+            echo "No pre-deployment deletion required."
+          fi
+
+          if ! az container create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --image "$IMAGE_FULL_NAME" \
+            --cpu "$CPU_CORES" \
+            --memory "$MEMORY_GB" \
+            --os-type Linux \
+            --restart-policy Always \
+            --ports 80 443 8080 \
+            --environment-variables CYCLECLOUD_AZURE_INTEGRATION=true \
+            --location "$AZURE_REGION" \
+            "${NETWORK_ARGS[@]}" \
+            --output none; then
+            echo "::error::az container create failed. Review Azure activity logs and ensure the service principal has Container Instance permissions."
+            exit 1
+          fi
+
+          echo "Deployment request submitted successfully."
+
+      - name: Collect container diagnostics
+        if: env.PROCEED_WITH_DEPLOYMENT == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for provisioning to complete."
+          az container wait \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --created \
+            --timeout 600 || echo "Container creation wait finished with non-zero code; continuing to gather diagnostics."
+
+          STATE=$(az container show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --query "instanceView.state" \
+            --output tsv 2>/dev/null || echo "unknown")
+
+          PRIVATE_IP=$(az container show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --query "ipAddress.ip" \
+            --output tsv 2>/dev/null || echo "unassigned")
+
+          FQDN=$(az container show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --query "ipAddress.fqdn" \
+            --output tsv 2>/dev/null || echo "unassigned")
+
+          IMAGE_REFERENCE=$(az container show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --query "containers[0].properties.image" \
+            --output tsv 2>/dev/null || echo "")
+
+          echo "CONTAINER_STATE=$STATE" >> "$GITHUB_ENV"
+          echo "CONTAINER_PRIVATE_IP=$PRIVATE_IP" >> "$GITHUB_ENV"
+          echo "CONTAINER_FQDN=$FQDN" >> "$GITHUB_ENV"
+          if [ -n "$IMAGE_REFERENCE" ]; then
+            echo "FINAL_CONTAINER_IMAGE=$IMAGE_REFERENCE" >> "$GITHUB_ENV"
+            if [[ "$IMAGE_REFERENCE" == *:* ]]; then
+              echo "FINAL_CONTAINER_TAG=${IMAGE_REFERENCE##*:}" >> "$GITHUB_ENV"
+            else
+              echo "FINAL_CONTAINER_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          echo "Container state: $STATE"
+          echo "Private IP: $PRIVATE_IP"
+          echo "FQDN (if public): $FQDN"
+
+          echo "Attempting to retrieve container logs for troubleshooting insight."
+          az container logs \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_INSTANCE_NAME" \
+            --output table || echo "Container logs are not yet available."
+
+      - name: Generate access summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXECUTED="${PROCEED_WITH_DEPLOYMENT:-true}"
+          MODE_LABEL="${DEPLOYMENT_MODE:-forced}"
+          DECISION="${DEPLOYMENT_DECISION_REASON:-No deployment decision recorded.}"
+          IMAGE_REASON="${IMAGE_SELECTION_REASON:-manual selection}"
+          FINAL_IMAGE="${FINAL_CONTAINER_IMAGE:-$CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG}"
+          FINAL_TAG="${FINAL_CONTAINER_TAG:-$IMAGE_TAG}"
+          if [ -z "$FINAL_IMAGE" ]; then
+            FINAL_IMAGE="$CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG"
+          fi
+
+          if [ "$EXECUTED" = "true" ]; then
+            ACTION_STATUS="Deployment executed (mode: $MODE_LABEL)."
+          else
+            ACTION_STATUS="No changes applied (mode: $MODE_LABEL)."
+          fi
+
+          PREVIOUS_TAG_DISPLAY="${EXISTING_CONTAINER_TAG:-not available}"
+
+          cat > CYCLECLOUD_MCR_ACCESS.md <<EOF
+          # CycleCloud on Azure Container Instances (MCR)
+
+          ## Deployment summary
+          - Container instance: $CONTAINER_INSTANCE_NAME
+          - Resource group: $AZURE_RESOURCE_GROUP
+          - Region: $AZURE_REGION
+          - Image: $FINAL_IMAGE
+          - Effective tag: $FINAL_TAG
+          - CPU: $CPU_CORES cores
+          - Memory: $MEMORY_GB GiB
+          - Network mode: $NETWORK_MODE
+          - Provisioning state: $CONTAINER_STATE
+          - Private IP: $CONTAINER_PRIVATE_IP
+          - FQDN (public deployments): $CONTAINER_FQDN
+
+          ## Deployment decision
+          - Mode: $MODE_LABEL
+          - Decision: $DECISION
+          - Action taken: $ACTION_STATUS
+
+          ## Registry tag selection
+          - Requested input tag: ${REQUESTED_IMAGE_TAG:-not provided}
+          - Selection rationale: $IMAGE_REASON
+          - Available tags file: available-tags.txt
+
+          ## Access guidance
+          - Primary endpoint (HTTP): http://$CONTAINER_PRIVATE_IP:80
+          - TLS endpoint: https://$CONTAINER_PRIVATE_IP:443
+          - CycleCloud interface: http://$CONTAINER_PRIVATE_IP:8080
+          - If the deployment used a public IP, replace the IP above with '$CONTAINER_FQDN'.
+
+          ## Required Azure prerequisites
+          - Service principal must have Microsoft.ContainerInstance/containerGroups permissions in '$AZURE_RESOURCE_GROUP'.
+          - For private networking, the subnet '$SUBNET_NAME' must allow container instance delegation.
+
+          ## Existing deployment before run
+          - Container detected before execution: ${CONTAINER_EXISTS:-false}
+          - Previous image tag: $PREVIOUS_TAG_DISPLAY
+          - Previous private IP: ${EXISTING_CONTAINER_PRIVATE_IP:-unassigned}
+          - Previous provisioning state: ${EXISTING_CONTAINER_PROVISIONING:-unknown}
+
+          ## Helpful Azure CLI commands
+          az container show --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_INSTANCE_NAME --output yaml
+          az container logs --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_INSTANCE_NAME
+          az container restart --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_INSTANCE_NAME
+          az container delete --resource-group $AZURE_RESOURCE_GROUP --name $CONTAINER_INSTANCE_NAME --yes
+
+          ## Troubleshooting hints
+          - Confirm outbound firewall rules permit access to mcr.microsoft.com (TCP 443).
+          - Inspect Azure Activity Log if provisioning fails for network reasons.
+          - Validate VNet delegation when using private networking.
+
+          Generated on $(date -u).
+          EOF
+
+      - name: Upload access artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyclecloud-mcr-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            CYCLECLOUD_MCR_ACCESS.md
+            available-tags.txt
+            selected-tag.txt
+            mcr-tags.json
+          retention-days: 30
+
+      - name: Deployment summary output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deployment completed for $CONTAINER_INSTANCE_NAME"
+          echo "Image: $CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG"
+          echo "Provisioning state: $CONTAINER_STATE"
+          echo "Resource group: $AZURE_RESOURCE_GROUP"
+          echo "Region: $AZURE_REGION"
+          echo "Network mode: $NETWORK_MODE"
+          echo "Private IP: $CONTAINER_PRIVATE_IP"
+          echo "FQDN: $CONTAINER_FQDN"
+          echo "Deployment mode: ${DEPLOYMENT_MODE:-forced}"
+          echo "Decision: ${DEPLOYMENT_DECISION_REASON:-not captured}"
+          if [ "${PROCEED_WITH_DEPLOYMENT:-true}" = "true" ]; then
+            echo "Action taken: Deployment executed."
+          else
+            echo "Action taken: No changes applied (existing deployment retained)."
+          fi
+          echo "Final container image: ${FINAL_CONTAINER_IMAGE:-$CONTAINER_REGISTRY/$CONTAINER_REPOSITORY:$IMAGE_TAG}"
+          echo "Final image tag: ${FINAL_CONTAINER_TAG:-$IMAGE_TAG}"
+          echo "Tag selection rationale: ${IMAGE_SELECTION_REASON:-manual selection}"
+          echo "Available tags artifact: available-tags.txt"
+          echo "Access details archived in artifact 'cyclecloud-mcr-${{ inputs.environment }}-${{ github.run_number }}'"

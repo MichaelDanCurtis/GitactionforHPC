@@ -1,0 +1,618 @@
+name: Workflow 2 - Create PBS Pro Cluster
+
+# PRIVATE networking ONLY. This workflow requires VNet configuration.
+# Configures CycleCloud autoscale and creates a PBS Pro cluster with private networking.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Azure resource group target"
+        required: true
+        type: choice
+        options:
+          - RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+          - RG-BH_HPC_Cloud_Azure-QA-SUB-000002-EastUS-qa
+        default: RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+      container_instance_name:
+        description: "CycleCloud Azure Container Instance name"
+        required: true
+        type: string
+        default: "cyclecloud-mcr"
+      cluster_name:
+        description: "Name for the new PBS Pro cluster"
+        required: true
+        type: string
+        default: "pbspro-cluster"
+      master_vm_size:
+        description: "Azure VM size for PBS master node"
+        required: false
+        type: string
+        default: "Standard_D4s_v3"
+      execute_vm_size:
+        description: "Azure VM size for execute nodes"
+        required: false
+        type: string
+        default: "Standard_F4s_v2"
+      max_execute_nodes:
+        description: "Maximum number of execute nodes"
+        required: false
+        type: number
+        default: 10
+      htc_vm_size:
+        description: "Azure VM size for HTC nodes"
+        required: false
+        type: string
+        default: "Standard_F2s_v2"
+      max_htc_nodes:
+        description: "Maximum number of HTC nodes"
+        required: false
+        type: number
+        default: 100
+      subnet_id:
+        description: "Azure subnet resource ID (REQUIRED - all nodes use private networking)"
+        required: true
+        type: string
+      auto_start_master:
+        description: "Automatically start the master node after creation"
+        required: false
+        type: boolean
+        default: true
+      ignore_queues:
+        description: "Comma separated queue names to ignore during autoscale"
+        required: false
+        type: string
+      cyclecloud_url:
+        description: "Base URL for the CycleCloud service"
+        required: false
+        type: string
+        default: "http://127.0.0.1:8080"
+
+jobs:
+  create-cluster:
+    name: Create PBS Pro cluster and configure autoscale
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login using federated credentials
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validate CycleCloud container instance
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          if [ -z "$RESOURCE_GROUP" ]; then
+            echo "::error::Repository variable RESOURCE_GROUP is required."
+            exit 1
+          fi
+
+          if ! az container show --resource-group "$RESOURCE_GROUP" --name "$CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "::error::Azure Container Instance '$CONTAINER_NAME' not found in '$RESOURCE_GROUP'."
+            exit 1
+          fi
+
+          STATE=$(az container show --resource-group "$RESOURCE_GROUP" --name "$CONTAINER_NAME" --query "instanceView.state" --output tsv 2>/dev/null || echo "unknown")
+          
+          if [ "$STATE" != "Running" ]; then
+            echo "::error::CycleCloud container is not running (state: $STATE)"
+            exit 1
+          fi
+          
+          echo "✅ CycleCloud container is running."
+
+      # ========================================
+      # STEP 1: Initialize CycleCloud CLI
+      # ========================================
+      
+      - name: Initialize CycleCloud CLI
+        shell: bash
+        env:
+          CYCLECLOUD_ADMIN_USERNAME: ${{ secrets.CYCLECLOUD_ADMIN_USERNAME }}
+          CYCLECLOUD_ADMIN_PASSWORD: ${{ secrets.CYCLECLOUD_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          if [ -z "$CYCLECLOUD_ADMIN_USERNAME" ] || [ -z "$CYCLECLOUD_ADMIN_PASSWORD" ]; then
+            echo "::error::Both CYCLECLOUD_ADMIN_USERNAME and CYCLECLOUD_ADMIN_PASSWORD secrets are required."
+            exit 1
+          fi
+          
+          echo "Initializing CycleCloud CLI..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cyclecloud initialize --batch --url=http://localhost:8080 --username=\"$CYCLECLOUD_ADMIN_USERNAME\" --password=\"$CYCLECLOUD_ADMIN_PASSWORD\" --verify-ssl=false'"
+          
+          echo "✅ CycleCloud CLI initialized."
+
+      # ========================================
+      # STEP 2: Upload PBS cluster-init project
+      # ========================================
+      
+      - name: Upload PBS autoscale cluster-init project
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          echo "Creating cluster-init project archive..."
+          tar -czf /tmp/pbspro-autoscale.tar.gz -C cluster-init pbspro-autoscale
+          
+          echo "Uploading project to CycleCloud container..."
+          PROJECT_B64=$(base64 < /tmp/pbspro-autoscale.tar.gz | tr -d '\n')
+          
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'mkdir -p /opt/cycle_server/work/uploads && echo \"$PROJECT_B64\" | base64 -d > /opt/cycle_server/work/uploads/pbspro-autoscale.tar.gz && cd /opt/cycle_server/work/uploads && tar -xzf pbspro-autoscale.tar.gz && cyclecloud project upload pbspro-autoscale'"
+          
+          echo "✅ Cluster-init project uploaded."
+
+      # ========================================
+      # STEP 3: Create cluster parameters
+      # ========================================
+      
+      - name: Generate cluster parameters
+        id: generate_params
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          SUBNET_ID="${{ inputs.subnet_id }}"
+          
+          if [ -z "$SUBNET_ID" ]; then
+            echo "::error::Subnet ID is required for private networking deployment"
+            echo "::error::All nodes use private IPs only. You must specify a subnet."
+            exit 1
+          fi
+          
+          cat > /tmp/cluster-params.json <<EOF
+          {
+            "ClusterName": "${{ inputs.cluster_name }}",
+            "Region": "${{ vars.AZURE_REGION }}",
+            "SubnetId": "$SUBNET_ID",
+            "MasterMachineType": "${{ inputs.master_vm_size }}",
+            "ExecuteMachineType": "${{ inputs.execute_vm_size }}",
+            "MaxExecuteCoreCount": $((${{ inputs.max_execute_nodes }} * 4)),
+            "HTCMachineType": "${{ inputs.htc_vm_size }}",
+            "MaxHTCCoreCount": $((${{ inputs.max_htc_nodes }} * 2)),
+            "Autoscale": true,
+            "ReturnProxy": true,
+            "UseLowPrio": false
+          }
+          EOF
+          
+          echo "Cluster parameters:"
+          cat /tmp/cluster-params.json
+          
+          PARAMS_B64=$(base64 < /tmp/cluster-params.json | tr -d '\n')
+          echo "params_b64=$PARAMS_B64" >> "$GITHUB_OUTPUT"
+
+      # ========================================
+      # STEP 4: Load and upload cluster template
+      # ========================================
+      
+      - name: Load cluster template from repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          TEMPLATE_FILE="cluster-init/cluster-templates/pbspro-cluster.txt"
+          
+          if [ ! -f "$TEMPLATE_FILE" ]; then
+            echo "::error::Cluster template not found at $TEMPLATE_FILE"
+            echo "::error::Please ensure cluster-init/cluster-templates/pbspro-cluster.txt exists in the repository"
+            exit 1
+          fi
+          
+          echo "Using cluster template from $TEMPLATE_FILE"
+          cp "$TEMPLATE_FILE" /tmp/pbspro-cluster.txt
+          
+          echo "✅ Template loaded successfully:"
+          head -20 /tmp/pbspro-cluster.txt
+
+      - name: Upload cluster template to container
+        shell: bash
+        env:
+          PARAMS_B64: ${{ steps.generate_params.outputs.params_b64 }}
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          TEMPLATE_B64=$(base64 < /tmp/pbspro-cluster.txt | tr -d '\n')
+          
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'echo \"$TEMPLATE_B64\" | base64 -d > /tmp/pbspro-cluster.txt && echo \"$PARAMS_B64\" | base64 -d > /tmp/cluster-params.json'"
+          
+          echo "✅ Template and parameters uploaded to container."
+
+      # ========================================
+      # STEP 5: Import and create cluster
+      # ========================================
+      
+      - name: Import and create cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          echo "Importing cluster template..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cyclecloud import_cluster \"$CLUSTER_NAME\" -f /tmp/pbspro-cluster.txt -p /tmp/cluster-params.json -c pbspro'"
+          
+          echo "✅ Cluster '$CLUSTER_NAME' created successfully."
+
+      - name: Start master node
+        if: inputs.auto_start_master == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          echo "Starting cluster master node..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cyclecloud start_cluster \"$CLUSTER_NAME\"'"
+          
+          echo "✅ Master node start initiated. This will take 10-15 minutes."
+
+      # ========================================
+      # STEP 6: Configure autoscale (azpbs)
+      # ========================================
+      
+      - name: Create azpbs installation package
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Package only what's needed on CycleCloud container
+          mkdir -p /tmp/cyclecloud-autoscale
+          cp cyclecloud-pbspro/install.sh /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/generate_autoscale_json.sh /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/logging.conf /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/autoscale_hook.py /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/server_dyn_res_wrapper.sh /tmp/cyclecloud-autoscale/
+          cp -r cyclecloud-pbspro/packages /tmp/cyclecloud-autoscale/
+          
+          tar -czf /tmp/cyclecloud-autoscale.tar.gz -C /tmp cyclecloud-autoscale
+          echo "✅ Autoscale package created: $(ls -lh /tmp/cyclecloud-autoscale.tar.gz)"
+
+      - name: Upload and install azpbs on CycleCloud container
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          ARCHIVE_B64=$(base64 < /tmp/cyclecloud-autoscale.tar.gz | tr -d '\n')
+          
+          echo "Uploading autoscale package to container..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'echo \"$ARCHIVE_B64\" | base64 -d > /tmp/cyclecloud-autoscale.tar.gz && mkdir -p /tmp/autoscale-install && tar -xzf /tmp/cyclecloud-autoscale.tar.gz -C /tmp/autoscale-install --strip-components=1'"
+          
+          echo "Installing azpbs on CycleCloud container..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cd /tmp/autoscale-install && chmod +x *.sh && ./install.sh --install-venv --cron-method none'"
+          
+          echo "✅ azpbs installed on container."
+
+      - name: Generate autoscale configuration
+        shell: bash
+        env:
+          CYCLECLOUD_ADMIN_USERNAME: ${{ secrets.CYCLECLOUD_ADMIN_USERNAME }}
+          CYCLECLOUD_ADMIN_PASSWORD: ${{ secrets.CYCLECLOUD_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          CYCLECLOUD_URL="${{ inputs.cyclecloud_url }}"
+          IGNORE_QUEUES="${{ inputs.ignore_queues }}"
+          
+          if [ -z "$CYCLECLOUD_ADMIN_USERNAME" ] || [ -z "$CYCLECLOUD_ADMIN_PASSWORD" ]; then
+            echo "::error::Both CYCLECLOUD_ADMIN_USERNAME and CYCLECLOUD_ADMIN_PASSWORD secrets are required."
+            exit 1
+          fi
+          
+          GENERATE_CMD="cd /tmp/autoscale-install && ./generate_autoscale_json.sh --username '$CYCLECLOUD_ADMIN_USERNAME' --password '$CYCLECLOUD_ADMIN_PASSWORD' --url '$CYCLECLOUD_URL' --cluster-name '$CLUSTER_NAME' --install-dir /opt/cycle/pbspro"
+          
+          if [ -n "$IGNORE_QUEUES" ]; then
+            GENERATE_CMD="$GENERATE_CMD --ignore-queues '$IGNORE_QUEUES'"
+          fi
+          
+          echo "Generating autoscale configuration..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c \"$GENERATE_CMD\""
+          
+          echo "✅ Autoscale configuration generated."
+
+      # ========================================
+      # STEP 7: Capture cluster information
+      # ========================================
+      
+      - name: Capture autoscale configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'if [ -f /opt/cycle/pbspro/autoscale.json ]; then cat /opt/cycle/pbspro/autoscale.json; fi'" > autoscale.json || true
+          
+          if [ -s autoscale.json ]; then
+            echo "✅ Autoscale configuration captured successfully."
+          else
+            echo "::warning::autoscale.json could not be retrieved."
+            rm -f autoscale.json || true
+          fi
+
+      - name: Get cluster status
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          echo "Retrieving cluster information..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cyclecloud show_cluster \"$CLUSTER_NAME\"'" > cluster-info.txt || true
+          
+          if [ -s cluster-info.txt ]; then
+            echo "✅ Cluster information:"
+            cat cluster-info.txt
+          fi
+
+      - name: Generate cluster access instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          cat > cluster-access.md <<EOF
+          # PBS Pro Cluster: $CLUSTER_NAME
+          
+          ## ✅ Cluster Created Successfully
+          
+          Your PBS Pro cluster with CycleCloud autoscale integration has been created and configured.
+          
+          ## Cluster Details
+          - **Cluster Name**: $CLUSTER_NAME
+          - **Master VM Size**: ${{ inputs.master_vm_size }}
+          - **Execute VM Size**: ${{ inputs.execute_vm_size }}
+          - **Max Execute Nodes**: ${{ inputs.max_execute_nodes }}
+          - **HTC VM Size**: ${{ inputs.htc_vm_size }}
+          - **Max HTC Nodes**: ${{ inputs.max_htc_nodes }}
+          - **Auto-started**: ${{ inputs.auto_start_master }}
+          - **Autoscale**: ✅ Configured
+          
+          ## Network Configuration (Private Only)
+          - **Subnet ID**: ${{ inputs.subnet_id }}
+          - **Public IPs**: ❌ None (all nodes use private networking)
+          - **Access**: Via VPN, Bastion, or Jump Box only
+          
+          ## Next Steps
+          
+          ### 1. Wait for Master Node
+          The master node takes **10-15 minutes** to provision. Monitor in CycleCloud UI or CLI.
+          
+          ### 2. Access the Master Node
+          Once the master node is **Ready** (check CycleCloud UI):
+          
+          **Via VPN:**
+          \`\`\`bash
+          # Get private IP from CycleCloud UI
+          ssh cyclecloud@<MASTER_PRIVATE_IP>
+          \`\`\`
+          
+          **Via Jump Box:**
+          \`\`\`bash
+          ssh -J user@jumpbox-ip cyclecloud@<MASTER_PRIVATE_IP>
+          \`\`\`
+          
+          **Via Azure Bastion:**
+          \`\`\`bash
+          az network bastion ssh \\
+            --name MyBastion \\
+            --resource-group MyRG \\
+            --target-resource-id <MASTER_VM_ID> \\
+            --auth-type ssh-key \\
+            --username cyclecloud \\
+            --ssh-key ~/.ssh/id_rsa
+          \`\`\`
+          
+          ### 3. Verify PBS Pro
+          \`\`\`bash
+          # Check PBS server status
+          qstat -B
+          
+          # List queues
+          qstat -Q
+          
+          # Check autoscale integration
+          azpbs nodes
+          \`\`\`
+          
+          ### 4. Submit Test Jobs
+          \`\`\`bash
+          # Submit to workq (execute nodes)
+          echo "hostname && sleep 60" | qsub -q workq -l select=1:ncpus=2
+          
+          # Submit to htcq (HTC nodes)
+          echo "hostname && sleep 30" | qsub -q htcq -l select=1:ncpus=1
+          
+          # Watch autoscale in action
+          watch -n 5 'qstat && echo && azpbs nodes'
+          \`\`\`
+          
+          ### 5. Monitor Autoscale
+          The cluster will automatically:
+          - ✅ Scale up nodes when jobs are queued
+          - ✅ Scale down idle nodes after timeout
+          - ✅ Respect max core limits
+          
+          ## CycleCloud CLI Commands
+          
+          Run these from your local machine (requires Azure CLI and network access):
+          
+          \`\`\`bash
+          # View cluster details
+          az container exec \\
+            --resource-group $RESOURCE_GROUP \\
+            --name $CONTAINER_NAME \\
+            --exec-command "/bin/bash -c 'cyclecloud show_cluster $CLUSTER_NAME'"
+          
+          # View cluster nodes
+          az container exec \\
+            --resource-group $RESOURCE_GROUP \\
+            --name $CONTAINER_NAME \\
+            --exec-command "/bin/bash -c 'cyclecloud show_nodes -c $CLUSTER_NAME'"
+          
+          # Stop cluster (master + all compute nodes)
+          az container exec \\
+            --resource-group $RESOURCE_GROUP \\
+            --name $CONTAINER_NAME \\
+            --exec-command "/bin/bash -c 'cyclecloud terminate_cluster $CLUSTER_NAME'"
+          
+          # Delete cluster completely
+          az container exec \\
+            --resource-group $RESOURCE_GROUP \\
+            --name $CONTAINER_NAME \\
+            --exec-command "/bin/bash -c 'cyclecloud delete_cluster $CLUSTER_NAME'"
+          \`\`\`
+          
+          ## Customization
+          
+          To customize the cluster configuration or PBS settings:
+          - **Cluster infrastructure**: Edit \`cluster-init/cluster-templates/pbspro-cluster.txt\`
+          - **PBS initialization**: Edit scripts in \`cluster-init/pbspro-autoscale/specs/default/cluster-init/scripts/\`
+          - **Autoscale settings**: Modify autoscale.json (downloaded as artifact)
+          
+          See \`cluster-init/cluster-templates/README.md\` for detailed customization guide.
+          
+          ## Troubleshooting
+          
+          **Master node won't start:**
+          - Check CycleCloud logs in the UI
+          - Verify subnet has available IPs
+          - Ensure service principal has VM creation permissions
+          
+          **Can't access master node:**
+          - Verify you're connected to VPN or using correct Bastion
+          - Check NSG rules on subnet
+          - Confirm master node is in "Ready" state
+          
+          **Autoscale not working:**
+          - SSH to master: \`systemctl status pbs\`
+          - Check PBS hooks: \`qmgr -c "list hook azpbs"\`
+          - View autoscale logs: \`tail -f /opt/cycle/pbspro/azpbs.log\`
+          
+          ---
+          **Generated**: $(date -u)  
+          **Workflow Run**: ${{ github.run_number }}
+          EOF
+          
+          echo "✅ Access instructions created."
+          cat cluster-access.md
+
+      - name: Upload cluster information artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbspro-cluster-${{ inputs.cluster_name }}-${{ github.run_number }}
+          path: |
+            cluster-access.md
+            cluster-info.txt
+            autoscale.json
+          retention-days: 30
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          # Cleanup on container
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'rm -rf /tmp/pbspro-cluster.txt /tmp/cluster-params.json /tmp/cyclecloud-autoscale.tar.gz /tmp/autoscale-install /opt/cycle_server/work/uploads/pbspro-autoscale.tar.gz'" || true
+          
+          # Cleanup local temp files
+          rm -rf /tmp/cyclecloud-autoscale /tmp/cyclecloud-autoscale.tar.gz /tmp/pbspro-autoscale.tar.gz || true
+          
+          echo "✅ Cleanup complete."
+
+      - name: Workflow summary
+        shell: bash
+        run: |
+          echo "## ✅ PBS Pro Cluster Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster Name**: \`${{ inputs.cluster_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Container**: \`${{ inputs.container_instance_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### What was configured:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ CycleCloud CLI initialized" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Cluster-init project uploaded" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ PBS Pro cluster created with private networking" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Master node started (if enabled)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ CycleCloud autoscale (azpbs) installed and configured" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Wait 10-15 minutes for master node to be **Ready**" >> $GITHUB_STEP_SUMMARY
+          echo "2. Access master node via VPN/Bastion (private IP only)" >> $GITHUB_STEP_SUMMARY
+          echo "3. Submit test jobs to verify autoscale" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 Download the **cluster-access.md** artifact for detailed instructions." >> $GITHUB_STEP_SUMMARY

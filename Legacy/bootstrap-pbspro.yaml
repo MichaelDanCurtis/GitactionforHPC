@@ -1,0 +1,184 @@
+name: Configure CycleCloud Autoscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Azure resource group target"
+        required: true
+        type: choice
+        options:
+          - RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+          - RG-BH_HPC_Cloud_Azure-QA-SUB-000002-EastUS-qa
+        default: RG-BH_HPC_Cloud_Azure-NP-SUB-000005-EastUS-dev
+      container_instance_name:
+        description: "CycleCloud Azure Container Instance name"
+        required: true
+        type: string
+        default: "cyclecloud-mcr"
+      cluster_name:
+        description: "CycleCloud cluster to manage with azpbs"
+        required: true
+        type: string
+      cyclecloud_url:
+        description: "Base URL for the CycleCloud service"
+        required: false
+        type: string
+        default: "http://127.0.0.1:8080"
+      ignore_queues:
+        description: "Comma separated queue names to ignore during autoscale"
+        required: false
+        type: string
+
+jobs:
+  configure-autoscale:
+    name: Configure CycleCloud autoscale integration
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login using federated credentials
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validate CycleCloud container instance
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          if [ -z "$RESOURCE_GROUP" ]; then
+            echo "::error::Repository variable RESOURCE_GROUP is required."
+            exit 1
+          fi
+
+          if ! az container show --resource-group "$RESOURCE_GROUP" --name "$CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "::error::Azure Container Instance '$CONTAINER_NAME' not found in '$RESOURCE_GROUP'."
+            exit 1
+          fi
+
+          STATE=$(az container show --resource-group "$RESOURCE_GROUP" --name "$CONTAINER_NAME" --query "instanceView.state" --output tsv 2>/dev/null || echo "unknown")
+          echo "CycleCloud container state: $STATE"
+
+      - name: Create azpbs installation package
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Package only what's needed on CycleCloud container
+          mkdir -p /tmp/cyclecloud-autoscale
+          cp cyclecloud-pbspro/install.sh /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/generate_autoscale_json.sh /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/logging.conf /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/autoscale_hook.py /tmp/cyclecloud-autoscale/
+          cp cyclecloud-pbspro/server_dyn_res_wrapper.sh /tmp/cyclecloud-autoscale/
+          cp -r cyclecloud-pbspro/packages /tmp/cyclecloud-autoscale/
+          
+          tar -czf /tmp/cyclecloud-autoscale.tar.gz -C /tmp cyclecloud-autoscale
+          echo "Autoscale package created: $(ls -lh /tmp/cyclecloud-autoscale.tar.gz)"
+
+      - name: Upload and install azpbs on CycleCloud container
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          ARCHIVE_B64=$(base64 < /tmp/cyclecloud-autoscale.tar.gz | tr -d '\n')
+          
+          echo "Uploading autoscale package to container..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'echo \"$ARCHIVE_B64\" | base64 -d > /tmp/cyclecloud-autoscale.tar.gz && mkdir -p /tmp/autoscale-install && tar -xzf /tmp/cyclecloud-autoscale.tar.gz -C /tmp/autoscale-install --strip-components=1'"
+          
+          echo "Installing azpbs on CycleCloud container..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'cd /tmp/autoscale-install && chmod +x *.sh && ./install.sh --install-venv --cron-method none'"
+
+      - name: Generate autoscale configuration
+        shell: bash
+        env:
+          CYCLECLOUD_ADMIN_USERNAME: ${{ secrets.CYCLECLOUD_ADMIN_USERNAME }}
+          CYCLECLOUD_ADMIN_PASSWORD: ${{ secrets.CYCLECLOUD_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          CYCLECLOUD_URL="${{ inputs.cyclecloud_url }}"
+          IGNORE_QUEUES="${{ inputs.ignore_queues }}"
+          
+          if [ -z "$CYCLECLOUD_ADMIN_USERNAME" ] || [ -z "$CYCLECLOUD_ADMIN_PASSWORD" ]; then
+            echo "::error::Both CYCLECLOUD_ADMIN_USERNAME and CYCLECLOUD_ADMIN_PASSWORD secrets are required."
+            exit 1
+          fi
+          
+          GENERATE_CMD="cd /tmp/autoscale-install && ./generate_autoscale_json.sh --username '$CYCLECLOUD_ADMIN_USERNAME' --password '$CYCLECLOUD_ADMIN_PASSWORD' --url '$CYCLECLOUD_URL' --cluster-name '$CLUSTER_NAME' --install-dir /opt/cycle/pbspro"
+          
+          if [ -n "$IGNORE_QUEUES" ]; then
+            GENERATE_CMD="$GENERATE_CMD --ignore-queues '$IGNORE_QUEUES'"
+          fi
+          
+          echo "Generating autoscale configuration..."
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c \"$GENERATE_CMD\""
+
+      - name: Capture autoscale configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'if [ -f /opt/cycle/pbspro/autoscale.json ]; then cat /opt/cycle/pbspro/autoscale.json; fi'" > autoscale.json || true
+          
+          if [ -s autoscale.json ]; then
+            echo "Autoscale configuration captured successfully."
+          else
+            echo "::warning::autoscale.json could not be retrieved."
+            rm -f autoscale.json || true
+          fi
+
+      - name: Upload autoscale artifact
+        if: hashFiles('autoscale.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyclecloud-autoscale-${{ inputs.environment }}-${{ github.run_number }}
+          path: autoscale.json
+          retention-days: 30
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          RESOURCE_GROUP="${{ vars.RESOURCE_GROUP }}"
+          CONTAINER_NAME="${{ inputs.container_instance_name }}"
+          
+          az container exec \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CONTAINER_NAME" \
+            --exec-command "/bin/bash -c 'rm -rf /tmp/cyclecloud-autoscale.tar.gz /tmp/autoscale-install'" || true
+          
+          echo "Cleanup complete."
