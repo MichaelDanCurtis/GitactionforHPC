@@ -24,31 +24,16 @@ on:
         required: true
         type: string
         default: "pbspro-cluster"
-      master_vm_size:
-        description: "Azure VM size for PBS master node"
-        required: false
-        type: string
-        default: "Standard_D4s_v3"
-      execute_vm_size:
-        description: "Azure VM size for execute nodes"
-        required: false
-        type: string
-        default: "Standard_F4s_v2"
-      max_execute_nodes:
-        description: "Maximum number of execute nodes"
-        required: false
-        type: number
-        default: 10
-      htc_vm_size:
-        description: "Azure VM size for HTC nodes"
-        required: false
-        type: string
-        default: "Standard_F2s_v2"
-      max_htc_nodes:
-        description: "Maximum number of HTC nodes"
-        required: false
-        type: number
-        default: 100
+      compute_profile:
+        description: "Compute sizing profile (sets VM sizes and max nodes). Choose 'custom' to provide JSON overrides."
+        required: true
+        type: choice
+        options:
+          - small
+          - medium
+          - large
+          - custom
+        default: small
       subnet_id:
         description: "Azure subnet resource ID (REQUIRED - all nodes use private networking)"
         required: true
@@ -72,6 +57,11 @@ on:
         required: false
         type: string
         default: "http://127.0.0.1:8080"
+      custom_config_json:
+        description: "Optional JSON to override defaults when compute_profile is 'custom'. Example: {\"MasterMachineType\":\"Standard_D8s_v3\",\"ExecuteMachineType\":\"Standard_F8s_v2\",\"MaxExecuteNodes\":20,\"HTCMachineType\":\"Standard_F4s_v2\",\"MaxHTCNodes\":200}"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   create-cluster:
@@ -182,33 +172,123 @@ jobs:
           set -euo pipefail
           
           SUBNET_ID="${{ inputs.subnet_id }}"
+          COMPUTE_PROFILE="${{ inputs.compute_profile }}"
+          IMAGE_NAME="${{ inputs.image_name }}"
+          CUSTOM_JSON="${{ inputs.custom_config_json }}"
+          AZURE_REGION="${{ vars.AZURE_REGION }}"
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
           
           if [ -z "$SUBNET_ID" ]; then
             echo "::error::Subnet ID is required for private networking deployment"
             echo "::error::All nodes use private IPs only. You must specify a subnet."
             exit 1
           fi
+
+          # Derive sizing based on compute_profile or custom JSON
+          MASTER_SIZE=""
+          EXEC_SIZE=""
+          MAX_EXEC_NODES=""
+          HTC_SIZE=""
+          MAX_HTC_NODES=""
+
+          case "$COMPUTE_PROFILE" in
+            small)
+              MASTER_SIZE="Standard_D4s_v3"
+              EXEC_SIZE="Standard_F4s_v2"
+              MAX_EXEC_NODES=10
+              HTC_SIZE="Standard_F2s_v2"
+              MAX_HTC_NODES=100
+              ;;
+            medium)
+              MASTER_SIZE="Standard_D8s_v3"
+              EXEC_SIZE="Standard_F8s_v2"
+              MAX_EXEC_NODES=50
+              HTC_SIZE="Standard_F4s_v2"
+              MAX_HTC_NODES=200
+              ;;
+            large)
+              MASTER_SIZE="Standard_D16s_v3"
+              EXEC_SIZE="Standard_F16s_v2"
+              MAX_EXEC_NODES=200
+              HTC_SIZE="Standard_F8s_v2"
+              MAX_HTC_NODES=500
+              ;;
+            custom)
+              if [ -z "$CUSTOM_JSON" ]; then
+                echo "::error::compute_profile is 'custom' but no custom_config_json was provided."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown compute_profile '$COMPUTE_PROFILE'"
+              exit 1
+              ;;
+          esac
           
-          cat > /tmp/cluster-params.json <<EOF
-          {
-            "ClusterName": "${{ inputs.cluster_name }}",
-            "Region": "${{ vars.AZURE_REGION }}",
-            "SubnetId": "$SUBNET_ID",
-            "ImageName": "${{ inputs.image_name }}",
-            "MasterMachineType": "${{ inputs.master_vm_size }}",
-            "ExecuteMachineType": "${{ inputs.execute_vm_size }}",
-            "MaxExecuteCoreCount": $((${{ inputs.max_execute_nodes }} * 4)),
-            "HTCMachineType": "${{ inputs.htc_vm_size }}",
-            "MaxHTCCoreCount": $((${{ inputs.max_htc_nodes }} * 2)),
-            "Autoscale": true,
-            "ReturnProxy": true,
-            "UseLowPrio": false
-          }
-          EOF
-          
+          # Build base params with jq
+          jq -n \
+            --arg CLUSTER_NAME "$CLUSTER_NAME" \
+            --arg AZURE_REGION "$AZURE_REGION" \
+            --arg SUBNET_ID "$SUBNET_ID" \
+            --arg IMAGE_NAME "$IMAGE_NAME" \
+            --arg MASTER_SIZE "$MASTER_SIZE" \
+            --arg EXEC_SIZE "$EXEC_SIZE" \
+            --arg HTC_SIZE "$HTC_SIZE" \
+            --arg MAX_EXEC_NODES "$MAX_EXEC_NODES" \
+            --arg MAX_HTC_NODES "$MAX_HTC_NODES" \
+            '{
+              ClusterName: $CLUSTER_NAME,
+              Region: $AZURE_REGION,
+              SubnetId: $SUBNET_ID,
+              ImageName: $IMAGE_NAME,
+              MasterMachineType: $MASTER_SIZE,
+              ExecuteMachineType: $EXEC_SIZE,
+              Autoscale: true,
+              ReturnProxy: true,
+              UseLowPrio: false
+            }
+            + (if $HTC_SIZE != "" then {HTCMachineType: $HTC_SIZE} else {} end)
+            + (if ($MAX_EXEC_NODES|length) > 0 then {MaxExecuteNodes: ($MAX_EXEC_NODES|tonumber)} else {} end)
+            + (if ($MAX_HTC_NODES|length) > 0 then {MaxHTCNodes: ($MAX_HTC_NODES|tonumber)} else {} end)
+            ' > /tmp/base.json
+
+          # Merge custom overrides if provided
+          if [ -n "$CUSTOM_JSON" ]; then
+            echo "$CUSTOM_JSON" > /tmp/custom.json
+            if ! jq empty /tmp/custom.json 2>/dev/null; then
+              echo "::error::custom_config_json is not valid JSON"
+              exit 1
+            fi
+            jq -s '.[0] * .[1]' /tmp/base.json /tmp/custom.json > /tmp/merged.json
+          else
+            cp /tmp/base.json /tmp/merged.json
+          fi
+
+          # Compute derived core counts when not provided
+          jq '
+            .MaxExecuteCoreCount = (if has("MaxExecuteCoreCount") then .MaxExecuteCoreCount else ((.MaxExecuteNodes // 10) * 4) end)
+            | .MaxHTCCoreCount = (if has("MaxHTCCoreCount") then .MaxHTCCoreCount else ((.MaxHTCNodes // 100) * 2) end)
+          ' /tmp/merged.json > /tmp/cluster-params.json
+
           echo "Cluster parameters:"
-          cat /tmp/cluster-params.json
+          cat /tmp/cluster-params.json | jq '.'
+
+          # Emit outputs for later steps
+          MASTER_OUT=$(jq -r '.MasterMachineType // ""' /tmp/cluster-params.json)
+          EXEC_OUT=$(jq -r '.ExecuteMachineType // ""' /tmp/cluster-params.json)
+          HTC_OUT=$(jq -r '.HTCMachineType // ""' /tmp/cluster-params.json)
+          MAX_EXEC_OUT=$(jq -r '.MaxExecuteNodes // empty' /tmp/cluster-params.json)
+          MAX_HTC_OUT=$(jq -r '.MaxHTCNodes // empty' /tmp/cluster-params.json)
+
+          {
+            echo "master_vm_size=$MASTER_OUT"
+            echo "execute_vm_size=$EXEC_OUT"
+            echo "htc_vm_size=$HTC_OUT"
+            echo "max_execute_nodes=$MAX_EXEC_OUT"
+            echo "max_htc_nodes=$MAX_HTC_OUT"
+          } >> "$GITHUB_OUTPUT"
           
+          # Encode params for upload
           PARAMS_B64=$(base64 < /tmp/cluster-params.json | tr -d '\n')
           echo "params_b64=$PARAMS_B64" >> "$GITHUB_OUTPUT"
 
@@ -433,11 +513,11 @@ jobs:
           
           ## Cluster Details
           - **Cluster Name**: $CLUSTER_NAME
-          - **Master VM Size**: ${{ inputs.master_vm_size }}
-          - **Execute VM Size**: ${{ inputs.execute_vm_size }}
-          - **Max Execute Nodes**: ${{ inputs.max_execute_nodes }}
-          - **HTC VM Size**: ${{ inputs.htc_vm_size }}
-          - **Max HTC Nodes**: ${{ inputs.max_htc_nodes }}
+          - **Master VM Size**: ${{ steps.generate_params.outputs.master_vm_size }}
+          - **Execute VM Size**: ${{ steps.generate_params.outputs.execute_vm_size }}
+          - **Max Execute Nodes**: ${{ steps.generate_params.outputs.max_execute_nodes }}
+          - **HTC VM Size**: ${{ steps.generate_params.outputs.htc_vm_size }}
+          - **Max HTC Nodes**: ${{ steps.generate_params.outputs.max_htc_nodes }}
           - **Auto-started**: ${{ inputs.auto_start_master }}
           - **Autoscale**: ✅ Configured
           
