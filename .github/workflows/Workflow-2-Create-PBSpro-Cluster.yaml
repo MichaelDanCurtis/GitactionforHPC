@@ -53,6 +53,11 @@ on:
         description: "Azure subnet resource ID (REQUIRED - all nodes use private networking)"
         required: true
         type: string
+      image_name:
+        description: "OS image for cluster nodes (marketplace: almalinux8, ubuntu22, etc. OR custom image resource ID)"
+        required: false
+        type: string
+        default: "almalinux8"
       auto_start_master:
         description: "Automatically start the master node after creation"
         required: false
@@ -189,6 +194,7 @@ jobs:
             "ClusterName": "${{ inputs.cluster_name }}",
             "Region": "${{ vars.AZURE_REGION }}",
             "SubnetId": "$SUBNET_ID",
+            "ImageName": "${{ inputs.image_name }}",
             "MasterMachineType": "${{ inputs.master_vm_size }}",
             "ExecuteMachineType": "${{ inputs.execute_vm_size }}",
             "MaxExecuteCoreCount": $((${{ inputs.max_execute_nodes }} * 4)),

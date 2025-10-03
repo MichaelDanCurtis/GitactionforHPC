@@ -23,6 +23,7 @@ Autoscale = $Autoscale
     Credentials = $Credentials
     Region = $Region
     KeyPairLocation = ~/.ssh/cyclecloud.pem
+    ImageName = $ImageName
     
         [[[configuration]]]
         cyclecloud.mounts.sched.disabled = true
@@ -93,6 +94,14 @@ Order = 10
         Label = Region
         Description = Azure region for the cluster
         ParameterType = Cloud.Region
+
+        [[[parameter ImageName]]]
+        Label = Base OS Image
+        Description = OS image for cluster nodes (marketplace image or custom image resource ID)
+        ParameterType = Cloud.Image
+        Config.OS = linux
+        DefaultValue = almalinux8
+        Config.Filter := Package in {"cycle.image.centos7", "cycle.image.ubuntu18", "cycle.image.ubuntu20", "cycle.image.ubuntu22", "almalinux8"}
 
         [[[parameter MasterMachineType]]]
         Label = Master VM Type

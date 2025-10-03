@@ -136,6 +136,7 @@ Deploys Azure CycleCloud as an Azure Container Instance with **private networkin
    - **Container name**: CycleCloud container instance name
    - **Cluster name**: Name for your PBS Pro cluster (e.g., `pbspro-cluster`)
    - **Subnet ID**: **REQUIRED** - Azure subnet resource ID
+   - **Image name**: OS image (default: `almalinux8`, or custom image ID)
    - **Master VM size**: Azure VM size for PBS master (default: `Standard_D4s_v3`)
    - **Execute VM size**: VM size for MPI workloads (default: `Standard_F4s_v2`)
    - **Max execute nodes**: Maximum execute nodes (default: 10)
@@ -285,6 +286,65 @@ watch qstat -a
 ```
 
 Nodes will scale up automatically based on job requirements, and scale down after 5 minutes of idle time.
+
+---
+
+## Custom Images
+
+### Using Marketplace Images (Default)
+
+The workflow defaults to `almalinux8` but supports multiple marketplace images:
+
+**Available options:**
+- `almalinux8` - AlmaLinux 8 (default, CentOS replacement)
+- `cycle.image.ubuntu22` - Ubuntu 22.04 LTS
+- `cycle.image.ubuntu20` - Ubuntu 20.04 LTS  
+- `cycle.image.centos7` - CentOS 7
+
+**Usage:**
+```bash
+gh workflow run Workflow-2-Create-PBSpro-Cluster.yaml \
+  -f image_name="cycle.image.ubuntu22" \
+  ...
+```
+
+### Using Custom Azure Images
+
+For pre-baked images with PBS Pro or custom software:
+
+**1. Create Custom Image in Azure:**
+```bash
+# Example: Create image from existing VM
+az image create \
+  --resource-group my-images-rg \
+  --name pbs-pro-custom-v1 \
+  --source /subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/my-vm
+```
+
+**2. Use in Workflow:**
+```bash
+gh workflow run Workflow-2-Create-PBSpro-Cluster.yaml \
+  -f image_name="/subscriptions/{sub-id}/resourceGroups/my-images-rg/providers/Microsoft.Compute/images/pbs-pro-custom-v1" \
+  ...
+```
+
+**3. Or Set as GitHub Variable:**
+```bash
+# Set once, use always
+gh variable set CUSTOM_IMAGE_ID \
+  --body "/subscriptions/{sub-id}/resourceGroups/my-images-rg/providers/Microsoft.Compute/images/pbs-pro-custom-v1"
+```
+
+Then reference in workflow:
+```yaml
+image_name: ${{ vars.CUSTOM_IMAGE_ID }}
+```
+
+**Benefits of Custom Images:**
+- ✅ Faster node startup (PBS Pro pre-installed)
+- ✅ Consistent environment across clusters
+- ✅ Pre-configured libraries and tools
+- ✅ Reduced cluster-init complexity
 
 ---
 
